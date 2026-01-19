@@ -3,7 +3,8 @@ requests
 pandas
 numpy
 aiohttp
-understat
+
+
 
 
 
