@@ -1,201 +1,146 @@
 # core/understat_client.py
 
 import json
-import asyncio
+import re
 from pathlib import Path
-from datetime import date
+from typing import Dict
 
 import pandas as pd
-import aiohttp
-from understat import Understat
+import requests
 
-
-# =========================================================
-# Mappa campionati football-data.org -> slug Understat
-# =========================================================
-UNDERSTAT_LEAGUES = {
-    "SA": "serie_a",
-    "PL": "epl",
-    "PD": "la_liga",
-    "BL1": "bundesliga",
-    "FL1": "ligue_1",
-}
-
-
-# =========================================================
-# Normalizzazione nomi (serve per join/mapping)
-# =========================================================
+# ==============================
+# NORMALIZZAZIONE NOMI SQUADRE
+# ==============================
 def normalize_name(x: str) -> str:
-    if x is None:
-        return ""
-    x = str(x).lower().strip()
-
-    # pulizie comuni
-    x = x.replace(".", " ")
-    x = x.replace("-", " ")
-    for t in [
-        " fc",
-        " cf",
-        " calcio",
-        " football club",
-        " f c",
-        " c f",
-        " afc",
-        " a f c",
-    ]:
-        x = x.replace(t, " ")
-
-    x = " ".join(x.split())
+    if not isinstance(x, str):
+        return x
+    x = x.lower().strip()
+    x = re.sub(r"\s+fc$", "", x)
+    x = re.sub(r"[^\w\s]", "", x)
+    x = re.sub(r"\s+", " ", x)
     return x
 
 
-# =========================================================
-# Fetch Understat (async) -> lista di match
-# =========================================================
-async def _fetch_understat_season(league_slug: str, season_start_year: int):
-    async with aiohttp.ClientSession() as session:
-        us = Understat(session)
-        data = await us.get_league_results(league_slug, season_start_year)
-        return data
+# ==============================
+# MAPPA CAMPIONATI
+# ==============================
+UNDERSTAT_LEAGUES = {
+    "SA": "serie-a",
+    "PL": "epl",
+    "PD": "la-liga",
+    "BL1": "bundesliga",
+    "FL1": "ligue-1",
+}
 
 
-def _run_async(coro):
-    """
-    Esegue una coroutine in modo compatibile anche se esiste già un event loop.
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
-
-
-# =========================================================
-# Conversione raw Understat -> DataFrame standard
-# =========================================================
-def _understat_to_df(raw: list) -> pd.DataFrame:
-    """
-    Output columns:
-      date | home | away | xg_home | xg_away
-    """
-    rows = []
-    for m in raw or []:
-        dt = (m.get("datetime") or "")[:10]  # YYYY-MM-DD
-        home = (m.get("h") or {}).get("title")
-        away = (m.get("a") or {}).get("title")
-
-        xg = m.get("xG") or {}
-        xg_h = xg.get("h", 0)
-        xg_a = xg.get("a", 0)
-
-        try:
-            xg_h = float(xg_h)
-        except Exception:
-            xg_h = None
-
-        try:
-            xg_a = float(xg_a)
-        except Exception:
-            xg_a = None
-
-        rows.append(
-            {
-                "date": dt,
-                "home": home,
-                "away": away,
-                "xg_home": xg_h,
-                "xg_away": xg_a,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-        df = df.dropna(subset=["date", "home", "away"])
-
-    return df
-
-
-# =========================================================
-# API principale usata da app.py
-# =========================================================
+# ==============================
+# DOWNLOAD + CACHE MATCHES
+# ==============================
 def get_understat_matches_season(
     cache_dir: Path,
     comp_code: str,
-    season_start_year: int,
-    ttl_hours: int = 24,
+    season: int,
+    force_refresh: bool = False,
 ) -> pd.DataFrame:
     """
-    Scarica i match Understat (xG reali) per una stagione.
-    Cache su JSON giornaliero:
-      data/cache/understat_{comp_code}_{season}_{YYYY-MM-DD}.json
+    Scarica i match Understat di una stagione (xG reali).
+    Usa cache JSON per Streamlit Cloud.
     """
-    league_slug = UNDERSTAT_LEAGUES.get(comp_code)
-    if not league_slug:
+
+    league = UNDERSTAT_LEAGUES.get(comp_code)
+    if not league:
         return pd.DataFrame()
 
-    cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"understat_{comp_code}_{season}.json"
 
-    today = date.today().isoformat()
-    cache_file = cache_dir / f"understat_{comp_code}_{season_start_year}_{today}.json"
-
-    # --- cache ---
-    if cache_file.exists():
+    # --- CACHE ---
+    if cache_file.exists() and not force_refresh:
         try:
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
-            return _understat_to_df(raw)
+            return _to_df(raw)
         except Exception:
             pass
 
-    # --- live fetch ---
+    # --- DOWNLOAD ---
+    url = f"https://understat.com/league/{league}/{season}"
+
     try:
-        raw = _run_async(_fetch_understat_season(league_slug, season_start_year))
-        cache_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-        return _understat_to_df(raw)
+        html = requests.get(url, timeout=20).text
     except Exception:
-        # se Understat down o blocco, torna vuoto senza crashare l'app
         return pd.DataFrame()
 
+    # Estrazione JSON embedded
+    marker = "var matchesData = JSON.parse('"
+    start = html.find(marker)
+    if start == -1:
+        return pd.DataFrame()
 
-# =========================================================
-# Long format: una riga per squadra per match (per rolling)
-# =========================================================
-def build_understat_team_match_index(us_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Trasforma i match Understat in formato LONG:
-      date, team, opponent, xg_for, xg_against
-    """
-    if us_df is None or us_df.empty:
-        return pd.DataFrame(columns=["date", "team", "opponent", "xg_for", "xg_against"])
+    start += len(marker)
+    end = html.find("');", start)
+    if end == -1:
+        return pd.DataFrame()
 
+    json_text = html[start:end]
+    json_text = bytes(json_text, "utf-8").decode("unicode_escape")
+
+    try:
+        raw = json.loads(json_text)
+    except Exception:
+        return pd.DataFrame()
+
+    cache_file.write_text(json.dumps(raw), encoding="utf-8")
+    return _to_df(raw)
+
+
+# ==============================
+# CONVERSIONE JSON → DATAFRAME
+# ==============================
+def _to_df(raw: Dict) -> pd.DataFrame:
     rows = []
-    for _, r in us_df.iterrows():
-        # home team
+
+    for m in raw.values():
         rows.append(
             {
-                "date": r["date"],
-                "team": r["home"],
-                "opponent": r["away"],
-                "xg_for": r["xg_home"],
-                "xg_against": r["xg_away"],
-            }
-        )
-        # away team
-        rows.append(
-            {
-                "date": r["date"],
-                "team": r["away"],
-                "opponent": r["home"],
-                "xg_for": r["xg_away"],
-                "xg_against": r["xg_home"],
+                "match_id": int(m["id"]),
+                "date": m["datetime"][:10],
+                "home": normalize_name(m["h"]["title"]),
+                "away": normalize_name(m["a"]["title"]),
+                "xg_home": float(m["xG"]["h"]),
+                "xg_away": float(m["xG"]["a"]),
+                "goals_home": int(m["goals"]["h"]),
+                "goals_away": int(m["goals"]["a"]),
             }
         )
 
-    df_long = pd.DataFrame(rows)
-    df_long["date"] = pd.to_datetime(df_long["date"], errors="coerce")
-    df_long = df_long.dropna(subset=["date", "team", "opponent"])
+    if not rows:
+        return pd.DataFrame()
 
-    return df_long
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+# ==============================
+# INDICE MATCH xG (CASA/TRASFERTA)
+# ==============================
+def build_understat_team_match_index(df_us: pd.DataFrame) -> Dict:
+    """
+    Ritorna:
+    {(team, match_id): {"xg_for": x, "xg_against": y}}
+    """
+
+    index = {}
+
+    for _, r in df_us.iterrows():
+        index[(r["home"], r["match_id"])] = {
+            "xg_for": r["xg_home"],
+            "xg_against": r["xg_away"],
+        }
+        index[(r["away"], r["match_id"])] = {
+            "xg_for": r["xg_away"],
+            "xg_against": r["xg_home"],
+        }
+
+    return index
 
