@@ -1,6 +1,18 @@
 import json
 import requests
 import pandas as pd
+
+def normalize_name(x: str) -> str:
+    if not isinstance(x, str):
+        return ""
+    x = x.lower().strip()
+    for t in [" fc", " cf", " calcio", " football club", " f.c.", " c.f.", " afc", " cfc"]:
+        x = x.replace(t, " ")
+    x = x.replace(".", " ")
+    x = x.replace("-", " ")
+    x = " ".join(x.split())
+    return x
+
 from pathlib import Path
 from datetime import date
 
@@ -69,3 +81,4 @@ def build_understat_team_match_index(df):
             "xg_against": r["xg_home"],
         })
     return pd.DataFrame(rows)
+
