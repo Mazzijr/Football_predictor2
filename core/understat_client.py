@@ -1,103 +1,152 @@
+# core/understat_client.py
 import json
 import asyncio
+import re
 from pathlib import Path
 from datetime import date, datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import aiohttp
+import requests
 from understat import Understat
 
-
-# --- DUE MAPPE LEGA: alcune versioni vogliono slug, altre titolo ---
-UNDERSTAT_LEAGUES_SLUG = {
-    "SA": "serie_a",
-    "PL": "epl",
-    "PD": "la_liga",
-    "BL1": "bundesliga",
-    "FL1": "ligue_1",
-}
-
-UNDERSTAT_LEAGUES_TITLE = {
-    "SA": "Serie A",
+# -------------------------------
+# Mapping campionati -> Understat (slug sito)
+# -------------------------------
+# NB: questi sono gli slug usati negli URL di understat.com
+UNDERSTAT_LEAGUE_SLUG = {
+    "SA": "Serie_A",
     "PL": "EPL",
-    "PD": "La liga",
+    "PD": "La_liga",
     "BL1": "Bundesliga",
-    "FL1": "Ligue 1",
+    "FL1": "Ligue_1",
 }
 
 
-def normalize_name(x: str) -> str:
-    if not isinstance(x, str):
-        return ""
-    x = x.lower().strip()
-    for t in [" fc", " cf", " calcio", " football club", " f.c.", " c.f.", " afc", " cfc"]:
-        x = x.replace(t, " ")
-    x = x.replace(".", " ").replace("-", " ")
-    return " ".join(x.split())
+def _cache_file(cache_dir: Path, comp_code: str, season_start_year: int) -> Path:
+    today = date.today().isoformat()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"understat_{comp_code}_{season_start_year}_{today}.json"
 
 
-def _cache_is_fresh(path: Path, ttl_hours: int = 24) -> bool:
+def _is_fresh(path: Path, ttl_hours: int) -> bool:
     if not path.exists():
         return False
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     return (datetime.now() - mtime) < timedelta(hours=ttl_hours)
 
 
-def _run_coro_cloud_safe(coro):
-    """Gestisce il caso in cui Streamlit abbia già un event loop attivo."""
-    try:
-        asyncio.get_running_loop()
-        running = True
-    except RuntimeError:
-        running = False
+async def _fetch_understat_lib(league_slug: str, season: int) -> list:
+    """
+    Fetch usando libreria 'understat' (scraping-based).
+    """
+    async with aiohttp.ClientSession() as session:
+        us = Understat(session)
+        # La libreria di solito accetta: "EPL", "Serie A", "La liga" ecc.
+        # ma in cloud può essere instabile. Proviamo alcune varianti.
+        league_variants = [
+            league_slug,  # a volte funziona
+            league_slug.replace("_", " "),  # "Serie A"
+            league_slug.replace("_", "").lower(),  # fallback
+        ]
+        last_err = None
+        for lg in league_variants:
+            try:
+                data = await us.get_league_results(lg, season)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+            except Exception as e:
+                last_err = e
+                continue
+        # se non funziona nulla, rilancia l'ultimo errore
+        if last_err:
+            raise last_err
+        return []
 
-    if not running:
-        return asyncio.run(coro)
 
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(lambda: asyncio.run(coro))
-        return fut.result()
+def _decode_understat_json_string(s: str) -> str:
+    """
+    Understat mette JSON dentro JSON.parse('....') con escape.
+    """
+    # sostituisce sequenze tipo \xNN e \uNNNN
+    s = s.encode("utf-8").decode("unicode_escape")
+    # ripulisce eventuali escape di slash
+    s = s.replace("\\/", "/")
+    return s
 
 
-def _understat_to_df(raw: list) -> pd.DataFrame:
+def _fetch_understat_site(league_slug: str, season: int) -> list:
+    """
+    Fallback robusto: scarica HTML da understat.com e parsifica datesData (match con xG).
+    """
+    url = f"https://understat.com/league/{league_slug}/{season}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    html = r.text
+
+    # cerca: datesData = JSON.parse('....')
+    m = re.search(r"datesData\s*=\s*JSON\.parse\('(.+?)'\)", html, re.DOTALL)
+    if not m:
+        return []
+
+    raw_str = m.group(1)
+    decoded = _decode_understat_json_string(raw_str)
+
+    data = json.loads(decoded)
+    # data è una lista di giornate; ogni elemento ha 'matches'
+    matches = []
+    for day in data:
+        for match in day.get("matches", []):
+            matches.append(match)
+
+    return matches
+
+
+def _understat_to_df(raw_matches: list) -> pd.DataFrame:
+    """
+    Standard:
+      date | home | away | xg_home | xg_away
+    """
     rows = []
-    for m in raw or []:
-        dt = (m.get("datetime") or "")[:10]
-        rows.append(
-            {
-                "data": dt,
-                "casa_us": (m.get("h") or {}).get("title"),
-                "trasferta_us": (m.get("a") or {}).get("title"),
-                "xg_casa": float(((m.get("xG") or {}).get("h", 0)) or 0),
-                "xg_trasferta": float(((m.get("xG") or {}).get("a", 0)) or 0),
-            }
-        )
+    for m in raw_matches or []:
+        # match structure: datetime, h.title, a.title, xG.h, xG.a
+        dt = m.get("datetime") or m.get("date") or ""
+        dt10 = str(dt)[:10]
+
+        h = (m.get("h") or {}).get("title") or (m.get("home") or {}).get("title")
+        a = (m.get("a") or {}).get("title") or (m.get("away") or {}).get("title")
+
+        xg = m.get("xG") or {}
+        xg_h = xg.get("h", None)
+        xg_a = xg.get("a", None)
+
+        def to_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return 0.0
+
+        if h and a and dt10:
+            rows.append({
+                "date": dt10,
+                "home": h,
+                "away": a,
+                "xg_home": to_float(xg_h),
+                "xg_away": to_float(xg_a),
+            })
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.date
-        df = df.dropna(subset=["data", "casa_us", "trasferta_us"])
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
     return df
-
-
-async def _fetch_understat_async(league: str, season: int) -> list:
-    # Headers “da browser” per evitare risposta vuota su Cloud
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
-    }
-
-    timeout = aiohttp.ClientTimeout(total=40)
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        us = Understat(session)
-        return await us.get_league_results(league, season)
 
 
 def get_understat_matches_season(
@@ -111,70 +160,74 @@ def get_understat_matches_season(
     Scarica i match Understat (xG reali) per una stagione.
     Cache giornaliera su file JSON.
     """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    today = date.today().isoformat()
-    cache_file = cache_dir / f"understat_{comp_code}_{season_start_year}_{today}.json"
+    league_slug = UNDERSTAT_LEAGUE_SLUG.get(comp_code)
+    if not league_slug:
+        return pd.DataFrame()
 
-    # cache
-    if (not force_refresh) and _cache_is_fresh(cache_file, ttl_hours=ttl_hours):
+    cache_file = _cache_file(cache_dir, comp_code, season_start_year)
+
+    # ---------- cache ----------
+    if (not force_refresh) and _is_fresh(cache_file, ttl_hours=ttl_hours):
         try:
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
             return _understat_to_df(raw)
         except Exception:
             pass
 
-    # prova prima slug, poi title
-    candidates = []
-    if comp_code in UNDERSTAT_LEAGUES_SLUG:
-        candidates.append(UNDERSTAT_LEAGUES_SLUG[comp_code])
-    if comp_code in UNDERSTAT_LEAGUES_TITLE:
-        candidates.append(UNDERSTAT_LEAGUES_TITLE[comp_code])
-
-    last_err = None
-    for league in candidates:
-        try:
-            raw = _run_coro_cloud_safe(_fetch_understat_async(league, season_start_year))
-            # se Understat ti ha risposto ma è vuoto, prova prossimo alias
-            if isinstance(raw, list) and len(raw) > 0:
-                cache_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-                return _understat_to_df(raw)
-        except Exception as e:
-            last_err = e
-            continue
-
-    # se arrivi qui: o blocco o veramente vuoto
-    # scrivo cache "vuota" per non martellare
+    # ---------- live fetch: 1) libreria understat  2) fallback sito ----------
+    raw_matches = []
     try:
-        cache_file.write_text(json.dumps([], ensure_ascii=False), encoding="utf-8")
+        raw_matches = asyncio.run(_fetch_understat_lib(league_slug, season_start_year))
+    except RuntimeError:
+        # event loop già attivo
+        loop = asyncio.get_event_loop()
+        raw_matches = loop.run_until_complete(_fetch_understat_lib(league_slug, season_start_year))
     except Exception:
-        pass
+        raw_matches = []
 
-    return pd.DataFrame()
+    # se libreria torna vuota, prova sito
+    if not raw_matches:
+        try:
+            raw_matches = _fetch_understat_site(league_slug, season_start_year)
+        except Exception:
+            raw_matches = []
+
+    # salva cache (anche se vuota? meglio NO)
+    if raw_matches:
+        try:
+            cache_file.write_text(json.dumps(raw_matches, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    return _understat_to_df(raw_matches)
 
 
 def build_understat_team_match_index(us_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trasforma i match Understat in formato LONG:
+      date, team, opponent, xg_for, xg_against
+    """
     rows = []
     if us_df is None or us_df.empty:
-        return pd.DataFrame(columns=["data", "team", "opponent", "xg_for", "xg_against"])
+        return pd.DataFrame(columns=["date", "team", "opponent", "xg_for", "xg_against"])
 
     for _, r in us_df.iterrows():
         rows.append({
-            "data": r["data"],
-            "team": r["casa_us"],
-            "opponent": r["trasferta_us"],
-            "xg_for": r["xg_casa"],
-            "xg_against": r["xg_trasferta"],
+            "date": r["date"],
+            "team": r["home"],
+            "opponent": r["away"],
+            "xg_for": r["xg_home"],
+            "xg_against": r["xg_away"],
         })
         rows.append({
-            "data": r["data"],
-            "team": r["trasferta_us"],
-            "opponent": r["casa_us"],
-            "xg_for": r["xg_trasferta"],
-            "xg_against": r["xg_casa"],
+            "date": r["date"],
+            "team": r["away"],
+            "opponent": r["home"],
+            "xg_for": r["xg_away"],
+            "xg_against": r["xg_home"],
         })
 
     df_long = pd.DataFrame(rows)
-    df_long["data"] = pd.to_datetime(df_long["data"], errors="coerce")
-    df_long["team_n"] = df_long["team"].map(normalize_name)
-    return df_long.sort_values(["team_n", "data"])
+    df_long["date"] = pd.to_datetime(df_long["date"], errors="coerce")
+    return df_long
 
