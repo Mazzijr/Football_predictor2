@@ -3,6 +3,9 @@ requests
 pandas
 numpy
 aiohttp
+beautifulsoup4
+lxml
+
 
 
 
