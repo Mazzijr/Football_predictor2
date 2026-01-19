@@ -10,8 +10,10 @@ import streamlit as st
 
 from core.understat_client import (
     get_understat_matches_season,
-    build_understat_team_match_index
+    build_understat_team_match_index,
+    normalize_name
 )
+
 
 
 # -------------------------------
@@ -641,6 +643,7 @@ with st.expander("🧩 Debug: partite senza xG (mismatch nomi)"):
 st.markdown("---")
 csv_bytes = df_show[cols].rename(columns=rename).to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Scarica tabella (CSV)", data=csv_bytes, file_name="football_predictor2_output.csv", mime="text/csv")
+
 
 
 
