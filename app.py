@@ -8,17 +8,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-def normalize_name(name):
-    if not isinstance(name, str):
-        return name
-    return (
-        name.strip()
-        .lower()
-        .replace(" fc", "")
-        .replace(".", "")
-    )
-
-
 from core.understat_client import (
     get_understat_matches_season,
     build_understat_team_match_index
@@ -652,5 +641,6 @@ with st.expander("🧩 Debug: partite senza xG (mismatch nomi)"):
 st.markdown("---")
 csv_bytes = df_show[cols].rename(columns=rename).to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Scarica tabella (CSV)", data=csv_bytes, file_name="football_predictor2_output.csv", mime="text/csv")
+
 
 
